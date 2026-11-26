@@ -1,314 +1,322 @@
 """
-CMA Lab 1: 2D foot and ankle angle analysis.
+CMA Lab 1 - 2D sagittale analyse van voet en enkel.
 
-Uses the sagittal Y-Z plane.  L1G1A02 is the standing trial used to establish
-the neutral ankle reference.  L1G1A03-L1G1A05 are the three walking trials.
+Assenstelsel: Y = looprichting (voorwaarts), Z = verticaal.  Alle hoeken worden
+in het Y-Z-vlak (sagittaal vlak) berekend; de X-coordinaat wordt genegeerd.
 
-The analysis makes the following explicit assumptions:
-* Y is the anterior-posterior (walking) axis and Z is vertical.
-* RHEE-RTOE represents the plantar-surface line in the sagittal plane.
-* RKNE-RANK represents the tibial long axis.
-* RTOE is a dorsum marker, so the absolute foot angles are approximate.
-* Neutral is the mean plantar-tibia angle in the standing trial.
+Trials
+    L1G1A02         : statische trial (rechtop staan)
+    L1G1A03 - A05   : drie looptrials in +Y-richting
+
+Uitvoer (map lab1_output/)
+    events.csv              : IC, foot flat, heel off en FC van elke stance
+    stance_values.csv       : hoekwaarden per stance
+    <trial>_angles.csv      : gefilterde markerdata + hoeken per frame
+    fig_oef1_contacten.png  : hiel- en teenhoogte met IC/FC
+    fig_oef2_voet_vloer.png : voet-vloerhoek met IC/FC en rockers
+    fig_oef3_enkel.png      : enkelhoek met IC/FC en rockers
 """
 
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
+from matplotlib.patches import Patch
+from scipy.signal import butter, filtfilt
 
+# --------------------------------------------------------------------------
+# Instellingen
+# --------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent
+WORKBOOK = ROOT.parent / "L1G1A.xlsx"
+OUTPUT_DIR = ROOT / "lab1_output"
 
-WORKBOOK = Path(
-    r"C:\Users\bertt\OneDrive - UGent\3de be sem1\biomechanics\lab1\L1G1A.xlsx"
-)
-OUTPUT_DIR = Path(__file__).resolve().parent / "lab1_output"
 STANDING_SHEET = "L1G1A02"
 TRIAL_SHEETS = ["L1G1A03", "L1G1A04", "L1G1A05"]
+MARKERS = ["RKNE", "RANK", "RHEE", "RTOE"]
+
+FS = 100.0            # samplefrequentie (Hz) - niet in de Excel vermeld, zie rapport
+CUTOFF = 6.0          # Butterworth low-pass cutoff (Hz)
+FC_SEARCH = 40        # FC wordt gezocht in de 40 frames na heel off
+ROCKER_THR_DEG = 2.0  # foot flat / heel off: voet-vloerhoek binnen +-2 graden
+
+COLORS = {"heel": "#1f77b4", "toe": "#ff7f0e", "ff": "#1f4e79", "ankle": "#8b1a1a"}
+ROCKER_COLORS = ["#fde0c5", "#d4ecd0", "#e3d4ec"]
+ROCKER_LABELS = ["1e rocker (heel)", "2e rocker (ankle)", "3e rocker (forefoot)"]
 
 
-def smooth(values: np.ndarray, window: int = 11) -> np.ndarray:
-    """Smooth a trajectory while retaining the same sample count."""
-    window = min(window, len(values))
-    if window % 2 == 0:
-        window -= 1
-    window = max(window, 3)
-    if window >= len(values):
-        return values.copy()
-    return savgol_filter(values, window_length=window, polyorder=2)
+# --------------------------------------------------------------------------
+# Data inlezen en filteren
+# --------------------------------------------------------------------------
+def read_trial(sheet: str) -> pd.DataFrame:
+    """Leest frame + Y/Z van de vier markers en filtert ze (4e orde Butterworth, 6 Hz)."""
+    raw = pd.read_excel(WORKBOOK, sheet_name=sheet, header=None)
+    header = raw.iloc[0].ffill()
+    data = raw.iloc[3:].apply(pd.to_numeric, errors="coerce").dropna(subset=[0])
+
+    df = pd.DataFrame({"Frame": data[0].astype(int).to_numpy()})
+    for marker in MARKERS:
+        cols = [c for c in raw.columns if str(header[c]).endswith(marker)]
+        y_col, z_col = cols[1], cols[2]          # kolommen X, Y, Z -> Y en Z nodig
+        df[f"{marker}_Y"] = data[y_col].to_numpy(float)
+        df[f"{marker}_Z"] = data[z_col].to_numpy(float)
+
+    b, a = butter(4, CUTOFF / (FS / 2))
+    for col in df.columns[1:]:
+        df[col] = filtfilt(b, a, df[col].to_numpy())
+    df["Time"] = (df["Frame"] - df["Frame"].iloc[0]) / FS
+    return df
 
 
-def line_angle(y1: np.ndarray, z1: np.ndarray,
-               y2: np.ndarray, z2: np.ndarray) -> np.ndarray:
-    """Counter-clockwise segment angle in the Y-Z plane, in degrees."""
-    return np.degrees(np.arctan2(z2 - z1, y2 - y1))
+def segment_angle(df: pd.DataFrame, distal: str, proximal: str) -> np.ndarray:
+    """Hoek (graden) van de vector distal->proximal t.o.v. de +Y-as in het Y-Z-vlak."""
+    dy = df[f"{proximal}_Y"] - df[f"{distal}_Y"]
+    dz = df[f"{proximal}_Z"] - df[f"{distal}_Z"]
+    return np.degrees(np.arctan2(dz, dy)).to_numpy()
 
 
-def read_marker_sheet(workbook: Path, sheet_name: str) -> pd.DataFrame:
-    """Read frame numbers and the Y/Z coordinates of the four markers."""
-    raw = pd.read_excel(workbook, sheet_name=sheet_name, header=None)
-
-    frames = pd.to_numeric(raw.iloc[2:, 0], errors="coerce").to_numpy()
-    # Columns: RKNE Y/Z = 2/3, RANK Y/Z = 5/6,
-    # RHEE Y/Z = 8/9, RTOE Y/Z = 11/12.
-    marker_columns = {
-        "RKNE": (2, 3),
-        "RANK": (5, 6),
-        "RHEE": (8, 9),
-        "RTOE": (11, 12),
+# --------------------------------------------------------------------------
+# Statische referentie
+# --------------------------------------------------------------------------
+def static_reference(standing: pd.DataFrame) -> dict:
+    """
+    In stand nemen we aan dat (1) de zool plat op de grond ligt en (2) de enkel
+    in neutrale stand staat (zool loodrecht op de tibia-as).  De hoeken die de
+    marker-lijnen dan maken, zijn dus vaste offsets door de markerplaatsing.
+    """
+    foot = segment_angle(standing, "RHEE", "RTOE")
+    tibia = segment_angle(standing, "RANK", "RKNE")
+    return {
+        "foot_offset": float(np.mean(foot)),     # HEE-TOE lijn t.o.v. zool
+        "tibia_static": float(np.mean(tibia)),   # KNE-ANK lijn in stand
+        "heel_z": float(standing["RHEE_Z"].mean()),
+        "toe_z": float(standing["RTOE_Z"].mean()),
     }
 
-    data = {"Frame": frames}
-    for marker, (y_col, z_col) in marker_columns.items():
-        data[f"{marker}_Y"] = pd.to_numeric(
-            raw.iloc[2:, y_col], errors="coerce"
-        ).to_numpy(dtype=float)
-        data[f"{marker}_Z"] = pd.to_numeric(
-            raw.iloc[2:, z_col], errors="coerce"
-        ).to_numpy(dtype=float)
 
-    result = pd.DataFrame(data).dropna(subset=["Frame"]).reset_index(drop=True)
-    result["Frame"] = result["Frame"].astype(int)
+def add_angles(df: pd.DataFrame, ref: dict) -> pd.DataFrame:
+    # Oef 2: voet-vloerhoek. Positief = tenen omhoog (hielcontact),
+    # negatief = hiel omhoog (push-off).
+    df["FootFloor"] = segment_angle(df, "RHEE", "RTOE") - ref["foot_offset"]
 
-    for marker in marker_columns:
-        result[f"{marker}_Y_s"] = smooth(result[f"{marker}_Y"].to_numpy())
-        result[f"{marker}_Z_s"] = smooth(result[f"{marker}_Z"].to_numpy())
-    return result
+    # Oef 3: enkelhoek. Hoek tussen tibia en zool; in neutrale stand 90 graden.
+    tibia = segment_angle(df, "RANK", "RKNE")
+    tibia_sole = tibia - df["FootFloor"]                      # hoek tibia-zool
+    tibia_sole_neutral = ref["tibia_static"]                  # = "90 graden" in stand
+    df["TibiaSoleRaw"] = tibia_sole
+    # Dorsiflexie (tibia kantelt naar de voetrug) verkleint de hoek -> positief.
+    df["Ankle"] = -(tibia_sole - tibia_sole_neutral)
+    return df
 
 
-def nearest_index(values: np.ndarray, target: float) -> int:
-    return int(np.argmin(np.abs(values - target)))
-
-
-def estimate_contacts(trial: pd.DataFrame) -> tuple[int, int]:
+# --------------------------------------------------------------------------
+# Gebeurtenissen (oef 1 en 4)
+# --------------------------------------------------------------------------
+def detect_events(df: pd.DataFrame, ref: dict) -> list[dict]:
     """
-    Estimate initial and final contact from vertical heel/toe trajectories.
-
-    Initial contact: lowest smoothed heel height in the first 35% of the trial.
-    Final contact: lowest smoothed toe height in the final 35% of the trial.
-
-    These are explicit simple-kinematics assumptions, appropriate for one
-    unsupported trajectory segment but not a force-platform measurement.
+    IC : laagste punt van de hielmarker na de swing (verticale snelheid hiel
+         gaat van negatief naar nul).
+    FC : maximale voorwaartse versnelling van de teenmarker na heel off
+         (de voet "schiet" weg van de grond; Hreljac & Marshall, 2000).
+    Foot flat : eerste frame na IC met voet-vloerhoek <= +2 graden.
+    Heel off  : eerste frame na foot flat met voet-vloerhoek <= -2 graden.
+    Enkel stances waarvan IC en FC allebei in de opname vallen, worden gehouden.
     """
-    n = len(trial)
-    heel_z = trial["RHEE_Z_s"].to_numpy()
-    toe_z = trial["RTOE_Z_s"].to_numpy()
+    heel_z = df["RHEE_Z"].to_numpy()
+    ff = df["FootFloor"].to_numpy()
+    toe_ay = np.gradient(np.gradient(df["RTOE_Y"].to_numpy())) * FS**2
+    vz = np.gradient(heel_z) * FS
+    n = len(df)
 
-    first_limit = max(1, int(np.floor(n * 0.35)))
-    last_start = max(0, int(np.ceil(n * 0.65)))
+    # kandidaat-IC: neerwaartse hielsnelheid wordt >= 0, terwijl de hiel laag is
+    # en kort daarvoor duidelijk aan het dalen was (einde swing, > 200 mm/s).
+    candidates = []
+    for i in range(1, n):
+        if vz[i - 1] < 0 <= vz[i] and heel_z[i] < ref["heel_z"] + 15:
+            recent = candidates and i - candidates[-1] < 50   # zelfde stance
+            if vz[max(0, i - 30):i].min() < -200 and not recent:
+                candidates.append(i)
 
-    ic_local = int(np.nanargmin(heel_z[:first_limit]))
-    fc_local = last_start + int(np.nanargmin(toe_z[last_start:]))
-    return ic_local, fc_local
-
-
-def standing_neutral_angle(standing: pd.DataFrame) -> float:
-    """Median angle difference between tibia and plantar segment while standing."""
-    plantar = line_angle(
-        standing["RHEE_Y_s"].to_numpy(),
-        standing["RHEE_Z_s"].to_numpy(),
-        standing["RTOE_Y_s"].to_numpy(),
-        standing["RTOE_Z_s"].to_numpy(),
-    )
-    tibia = line_angle(
-        standing["RANK_Y_s"].to_numpy(),
-        standing["RANK_Z_s"].to_numpy(),
-        standing["RKNE_Y_s"].to_numpy(),
-        standing["RKNE_Z_s"].to_numpy(),
-    )
-    return float(np.nanmedian(tibia - plantar))
-
-
-def calculate_angles(trial: pd.DataFrame, neutral_relative: float) -> pd.DataFrame:
-    """
-    Calculate raw and neutral-offset angles.
-
-    The foot-floor angle is the directed angle of RHEE-RTOE relative to the
-    horizontal.  Its sign convention is positive after initial heel contact
-    and negative near push-off.  The second plot preserves the magnitude from
-    the 2D plantar/tibia segment calculation and offsets it to standing neutral.
-    """
-    result = trial.copy()
-
-    plantar_floor_raw = line_angle(
-        result["RHEE_Y_s"].to_numpy(),
-        result["RHEE_Z_s"].to_numpy(),
-        result["RTOE_Y_s"].to_numpy(),
-        result["RTOE_Z_s"].to_numpy(),
-    )
-
-    ic, fc = estimate_contacts(result)
-    plantar_magnitude = np.abs(plantar_floor_raw)
-    heel_off = max(ic, ic + int((fc - ic) * 0.64))
-
-    plantar_floor_signed = plantar_magnitude.copy()
-    plantar_floor_signed[:ic] = plantar_magnitude[:ic]
-    plantar_floor_signed[heel_off:] = -plantar_magnitude[heel_off:]
-    plantar_floor_signed[ic:heel_off] = plantar_magnitude[ic:heel_off]
-
-    plantar = line_angle(
-        result["RHEE_Y_s"].to_numpy(),
-        result["RHEE_Z_s"].to_numpy(),
-        result["RTOE_Y_s"].to_numpy(),
-        result["RTOE_Z_s"].to_numpy(),
-    )
-    tibia = line_angle(
-        result["RANK_Y_s"].to_numpy(),
-        result["RANK_Z_s"].to_numpy(),
-        result["RKNE_Y_s"].to_numpy(),
-        result["RKNE_Z_s"].to_numpy(),
-    )
-    tibia_relative_plantar = tibia - plantar
-
-    # Positive values correspond to increasing tibia-plantar separation
-    # (the forward tibial movement used here as dorsiflexion).
-    ankle_offset = tibia_relative_plantar - neutral_relative
-
-    result["FootFloor_Raw_deg"] = plantar_floor_raw
-    result["FootFloor_Signed_deg"] = plantar_floor_signed
-    result["Ankle_deg"] = ankle_offset
-    result["InitialContact"] = 0
-    result["FinalContact"] = 0
-    result.loc[result.index[ic], "InitialContact"] = 1
-    result.loc[result.index[fc], "FinalContact"] = 1
-    result.attrs["initial_contact_index"] = ic
-    result.attrs["final_contact_index"] = fc
-    result.attrs["heel_off_index"] = heel_off
-    foot_flat = ic + int((heel_off - ic) * 0.45)
-    foot_flat = min(max(foot_flat, ic), heel_off)
-    result.attrs["foot_flat_index"] = foot_flat
-
-    return result
-
-
-def add_rocker_background(ax, trial: pd.DataFrame) -> None:
-    ic = trial.attrs["initial_contact_index"]
-    fc = trial.attrs["final_contact_index"]
-    heel_off = trial.attrs["heel_off_index"]
-    n = len(trial)
-
-    # Foot flat is placed at the midpoint of the first two rocker boundaries.
-    foot_flat = ic + int((heel_off - ic) * 0.45)
-    foot_flat = min(max(foot_flat, ic), heel_off)
-
-    boundaries = [
-        (ic, foot_flat, "1st rocker", "#fee8c8"),
-        (foot_flat, heel_off, "2nd rocker", "#ccebc5"),
-        (heel_off, fc, "3rd rocker", "#dec5e5"),
-    ]
-
-    for start, end, label, color in boundaries:
-        if end <= start:
+    events = []
+    for ic in candidates:
+        after = np.arange(ic, n)
+        flat = after[ff[after] <= ROCKER_THR_DEG]
+        if flat.size == 0:
             continue
-        ax.axvspan(trial["Frame"].iloc[start], trial["Frame"].iloc[min(end, n - 1)],
-                   color=color, alpha=0.55)
-        ax.text(
-            trial["Frame"].iloc[min((start + end) // 2, n - 1)],
-            ax.get_ylim()[1],
-            label,
-            ha="center",
-            va="top",
-            fontsize=8,
-        )
+        foot_flat = int(flat[0])
+        off = after[(after > foot_flat) & (ff[after] <= -ROCKER_THR_DEG)]
+        if off.size == 0:
+            continue
+        heel_off = int(off[0])
+        if heel_off + FC_SEARCH >= n:          # opname stopt te vroeg
+            continue
+        win = np.arange(heel_off, heel_off + FC_SEARCH)
+        fc = int(win[np.argmax(toe_ay[win])])
+        if not ic < foot_flat < heel_off < fc:
+            continue
+        events.append({"IC": ic, "FootFlat": foot_flat, "HeelOff": heel_off, "FC": fc})
 
-    trial.attrs["foot_flat_index"] = foot_flat
+    # volgende IC (voor stride-tijd); ook een IC waarvan de FC buiten de
+    # opname valt, telt hier mee.
+    for ev in events:
+        later = [c for c in candidates if c > ev["IC"]]
+        ev["NextIC"] = later[0] if later else None
+    return events
 
 
-def plot_trial(trial: pd.DataFrame, sheet_name: str) -> Path:
-    ic = trial.attrs["initial_contact_index"]
-    fc = trial.attrs["final_contact_index"]
-    heel_off = trial.attrs["heel_off_index"]
-    foot_flat = trial.attrs["foot_flat_index"]
+# --------------------------------------------------------------------------
+# Figuren
+# --------------------------------------------------------------------------
+def _mark_contacts(ax, df, events, label=True):
+    for k, ev in enumerate(events):
+        ax.axvline(df["Time"].iloc[ev["IC"]], color="black", lw=1.0, ls="--",
+                   label="IC" if (label and k == 0) else None)
+        ax.axvline(df["Time"].iloc[ev["FC"]], color="0.45", lw=1.0, ls=":",
+                   label="FC" if (label and k == 0) else None)
 
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 
-    axes[0].plot(trial["Frame"], trial["FootFloor_Signed_deg"],
-                 color="#1f77b4", linewidth=1.8,
-                 label="Foot-floor angle")
-    axes[0].axhline(0, color="0.35", linewidth=0.8)
-    axes[0].set_ylabel("Foot-floor angle (degrees)")
-    axes[0].set_title(f"{sheet_name}: 2D foot-floor angle")
-    add_rocker_background(axes[0], trial)
+def _shade_rockers(ax, df, events):
+    t = df["Time"].to_numpy()
+    for ev in events:
+        bounds = [ev["IC"], ev["FootFlat"], ev["HeelOff"], ev["FC"]]
+        for j in range(3):
+            ax.axvspan(t[bounds[j]], t[bounds[j + 1]], color=ROCKER_COLORS[j],
+                       alpha=0.9, lw=0, zorder=0)
 
-    axes[1].plot(trial["Frame"], trial["Ankle_deg"],
-                 color="#d62728", linewidth=1.8,
-                 label="Ankle angle")
-    axes[1].axhline(0, color="0.35", linewidth=0.8)
-    axes[1].set_ylabel("Ankle angle relative to standing (degrees)")
-    axes[1].set_xlabel("Frame")
-    axes[1].set_title(f"{sheet_name}: 2D plantar-tibia angle")
-    add_rocker_background(axes[1], trial)
 
-    for ax in axes:
-        ax.axvline(trial["Frame"].iloc[ic], color="#111111", linestyle="--",
-                   linewidth=1.2, label="Initial contact")
-        ax.axvline(trial["Frame"].iloc[fc], color="#7f7f7f", linestyle="--",
-                   linewidth=1.2, label="Final contact")
-        ax.axvline(trial["Frame"].iloc[foot_flat], color="#2ca02c",
-                   linestyle=":", linewidth=1.1, label="Foot flat")
-        ax.axvline(trial["Frame"].iloc[heel_off], color="#9467bd",
-                   linestyle=":", linewidth=1.1, label="Heel off")
-        ax.legend(loc="upper right", fontsize=8)
+def _rocker_legend_handles():
+    return [Patch(color=c, label=l) for c, l in zip(ROCKER_COLORS, ROCKER_LABELS)]
+
+
+def plot_contacts(trials: dict, path: Path) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=False)
+    for ax, (name, (df, events)) in zip(axes, trials.items()):
+        ax.plot(df["Time"], df["RHEE_Z"], color=COLORS["heel"], lw=1.5, label="RHEE (hiel)")
+        ax.plot(df["Time"], df["RTOE_Z"], color=COLORS["toe"], lw=1.5, label="RTOE (teen)")
+        t = df["Time"].to_numpy()
+        for k, ev in enumerate(events):
+            ax.plot(t[ev["IC"]], df["RHEE_Z"].iloc[ev["IC"]], "v", color="black",
+                    ms=7, label="IC" if k == 0 else None, zorder=5)
+            ax.plot(t[ev["FC"]], df["RTOE_Z"].iloc[ev["FC"]], "^", color="#2ca02c",
+                    ms=7, label="FC" if k == 0 else None, zorder=5)
+            ax.axvline(t[ev["IC"]], color="black", lw=0.6, ls="--", alpha=0.6)
+            ax.axvline(t[ev["FC"]], color="#2ca02c", lw=0.6, ls=":", alpha=0.8)
+        ax.set_title(f"Trial {name}", fontsize=10, loc="left")
+        ax.set_ylabel("Hoogte Z (mm)")
+        ax.set_xlim(t[0], t[-1])
         ax.grid(alpha=0.25)
-
-    fig.tight_layout()
-    output = OUTPUT_DIR / f"{sheet_name}_angles.png"
-    fig.savefig(output, dpi=180)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncols=4, fontsize=9, frameon=False)
+    axes[-1].set_xlabel("Tijd (s)")
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    fig.savefig(path, dpi=200)
     plt.close(fig)
-    return output
 
 
-def main() -> None:
-    if not WORKBOOK.exists():
-        raise FileNotFoundError(f"Workbook not found: {WORKBOOK}")
+def plot_angle(trials: dict, column: str, ylabel: str, color: str, path: Path,
+               neg_label: str, pos_label: str) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9))
+    for ax, (name, (df, events)) in zip(axes, trials.items()):
+        _shade_rockers(ax, df, events)
+        ax.plot(df["Time"], df[column], color=color, lw=1.6, zorder=3)
+        ax.axhline(0, color="0.3", lw=0.8)
+        _mark_contacts(ax, df, events)
+        ax.set_title(f"Trial {name}", fontsize=10, loc="left")
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(df["Time"].iloc[0], df["Time"].iloc[-1])
+        ax.grid(alpha=0.25, zorder=1)
+        ax.text(1.005, 0.98, pos_label, transform=ax.transAxes, fontsize=7,
+                va="top", rotation=90, color="0.35")
+        ax.text(1.005, 0.02, neg_label, transform=ax.transAxes, fontsize=7,
+                va="bottom", rotation=90, color="0.35")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles + _rocker_legend_handles(), labels + ROCKER_LABELS,
+               loc="upper center", ncols=5, fontsize=9, frameon=False)
+    axes[-1].set_xlabel("Tijd (s)")
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
+
+# --------------------------------------------------------------------------
+# Tabellen
+# --------------------------------------------------------------------------
+def tabulate(trials: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ev_rows, val_rows = [], []
+    for name, (df, events) in trials.items():
+        t = df["Time"].to_numpy()
+        f = df["Frame"].to_numpy()
+        for k, ev in enumerate(events, start=1):
+            ic, ffl, ho, fc = ev["IC"], ev["FootFlat"], ev["HeelOff"], ev["FC"]
+            stance = fc - ic
+            stride = (ev["NextIC"] - ic) if ev["NextIC"] is not None else np.nan
+            ev_rows.append({
+                "Trial": name, "Stap": k,
+                "IC_frame": f[ic], "FC_frame": f[fc],
+                "IC_s": round(t[ic], 2), "FC_s": round(t[fc], 2),
+                "FootFlat_frame": f[ffl], "HeelOff_frame": f[ho],
+                "Stance_s": stance / FS,
+                "Stride_s": stride / FS,
+                "Stance_pct": 100 * stance / stride if stride == stride else np.nan,
+                "Rocker1_pct": 100 * (ffl - ic) / stance,
+                "Rocker2_pct": 100 * (ho - ffl) / stance,
+                "Rocker3_pct": 100 * (fc - ho) / stance,
+            })
+            seg = slice(ic, fc + 1)
+            ankle = df["Ankle"].to_numpy()
+            footf = df["FootFloor"].to_numpy()
+            # piek plantairflexie rond toe-off: zoek tot 10 frames na FC
+            pf_end = min(len(df), fc + 10)
+            val_rows.append({
+                "Trial": name, "Stap": k,
+                "FF_IC": footf[ic],
+                "FF_max_r1": footf[ic:ffl + 1].max(),
+                "FF_FC": footf[fc],
+                "Ankle_IC": ankle[ic],
+                "Ankle_min_r1": ankle[ic:ho + 1][: (ffl - ic) + 10].min(),
+                "Ankle_max_DF": ankle[seg].max(),
+                "Ankle_FC": ankle[fc],
+                "Ankle_max_PF": ankle[ho:pf_end].min(),
+            })
+    return pd.DataFrame(ev_rows), pd.DataFrame(val_rows)
+
+
+# --------------------------------------------------------------------------
+def run() -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    standing = read_trial(STANDING_SHEET)
+    ref = static_reference(standing)
 
-    standing = read_marker_sheet(WORKBOOK, STANDING_SHEET)
-    neutral_relative = standing_neutral_angle(standing)
-    print(f"Standing-sheet median tibia-relative-to-plantar angle: "
-          f"{neutral_relative:.2f} deg")
+    trials = {}
+    for sheet in TRIAL_SHEETS:
+        df = add_angles(read_trial(sheet), ref)
+        events = detect_events(df, ref)
+        df.to_csv(OUTPUT_DIR / f"{sheet}_angles.csv", index=False)
+        trials[sheet] = (df, events)
 
-    summary_rows = []
-    for sheet_name in TRIAL_SHEETS:
-        trial = read_marker_sheet(WORKBOOK, sheet_name)
-        ic, fc = estimate_contacts(trial)
-        trial = calculate_angles(trial, neutral_relative)
-        heel_off = trial.attrs["heel_off_index"]
-        foot_flat = trial.attrs["foot_flat_index"]
+    events_df, values_df = tabulate(trials)
+    events_df.to_csv(OUTPUT_DIR / "events.csv", index=False)
+    values_df.to_csv(OUTPUT_DIR / "stance_values.csv", index=False)
 
-        ic_frame = int(trial["Frame"].iloc[ic])
-        fc_frame = int(trial["Frame"].iloc[fc])
-        foot_flat_frame = int(trial["Frame"].iloc[foot_flat])
-        heel_off_frame = int(trial["Frame"].iloc[heel_off])
+    figs = {
+        "oef1": OUTPUT_DIR / "fig_oef1_contacten.png",
+        "oef2": OUTPUT_DIR / "fig_oef2_voet_vloer.png",
+        "oef3": OUTPUT_DIR / "fig_oef3_enkel.png",
+    }
+    plot_contacts(trials, figs["oef1"])
+    plot_angle(trials, "FootFloor", "Voet-vloerhoek (°)", COLORS["ff"], figs["oef2"],
+               neg_label="hiel omhoog", pos_label="tenen omhoog")
+    plot_angle(trials, "Ankle", "Enkelhoek (°)", COLORS["ankle"], figs["oef3"],
+               neg_label="plantairflexie", pos_label="dorsiflexie")
 
-        trial.to_csv(OUTPUT_DIR / f"{sheet_name}_angles.csv", index=False)
-        plot_path = plot_trial(trial, sheet_name)
-        print(
-            f"{sheet_name}: IC frame {ic_frame}; foot-flat frame "
-            f"{foot_flat_frame}; heel-off frame {heel_off_frame}; "
-            f"FC frame {fc_frame}"
-        )
-        print(f"  plot: {plot_path}")
-
-        summary_rows.append({
-            "Sheet": sheet_name,
-            "InitialContactFrame": ic_frame,
-            "FootFlatFrame": foot_flat_frame,
-            "HeelOffFrame": heel_off_frame,
-            "FinalContactFrame": fc_frame,
-            "InitialContactIndex": ic,
-            "FootFlatIndex": foot_flat,
-            "HeelOffIndex": heel_off,
-            "FinalContactIndex": fc,
-        })
-
-    pd.DataFrame(summary_rows).to_csv(
-        OUTPUT_DIR / "contact_summary.csv", index=False
-    )
-    print(f"\nAll output written to: {OUTPUT_DIR}")
+    return {"ref": ref, "trials": trials, "events": events_df,
+            "values": values_df, "figs": figs}
 
 
 if __name__ == "__main__":
-    main()
+    res = run()
+    pd.set_option("display.width", 200)
+    print("Statische referentie:", {k: round(v, 2) for k, v in res["ref"].items()})
+    print(res["events"].round(2).to_string(index=False))
+    print(res["values"].round(1).to_string(index=False))
